@@ -4,11 +4,14 @@ import asyncio
 import cgi
 import io
 import os
+import re
 import selectors
 import socket
 import ssl
+import sys
 import time
 import logging
+import types
 import urllib.parse
 import uuid
 
@@ -88,6 +91,7 @@ MINE_TYPE_DEFINED = {
     ".ipa": "application/vnd.iphone",
     ".apk": "application/vnd.android.package-archive",
 }
+
 
 class Utils:
 
@@ -213,6 +217,441 @@ class Buffer:
             return self.buffer.getvalue()
 
 
+# 模板渲染
+class UIModuleNameSpace(object):
+    """ """
+
+    def __init__(self, handler, modules):
+        """ """
+        self.handler = handler
+        self.ui_modules = modules
+
+    def __getitem__(self, key):
+        """ """
+        ui_module = getattr(self.handler, "_ui_module")
+        if ui_module:
+            return ui_module(key, self.ui_modules[key])
+        raise NotImplementedError
+
+    def __getattr__(self, key):
+        """ """
+        return self[key]
+
+
+class UIModule(object):
+    """ """
+
+    def __init__(self, handler):
+        """ """
+        self.handler = handler
+
+    def render(self, *args, **kwargs):
+        """ """
+        pass
+
+    def render_string(self, path, **kwargs):
+        """Renders a template and returns it as a string."""
+        return self.handler.render_string(path, **kwargs)
+
+
+class Template(object):
+    """ html渲染模版 使用tornado的模版去掉了他里面我不需要的内容重新组成 """
+
+    def __init__(self, template_string, name="<string>", modules=None, compress_whitespace=False):
+        """
+        template_string  需要渲染的模版文本
+        name  可选传入文件名方便识别
+        compress_whitespace  是否需要压缩空行和换行等 一般js css需要
+        """
+        self.name = name
+        self.autoescape = "xhtml_escape"
+        # modules 模块列表，用于html中引用其他模块 内置对象为 _tt_modules
+        self.namespace = {"_tt_modules": modules} if modules else {}
+        # 编译资源
+        self.compiled = None
+        self._compile_code(self.name, template_string, compress_whitespace)
+
+    def generate(self, **kwargs):
+        """ 根据指定的参数 生成模版 """
+        # 内置的转换函数
+        namespace = {
+            "escape": Utils.html_escape,
+            "xhtml_escape": Utils.html_escape,
+            "_tt_utf8": Utils.to_utf8,
+        }
+        namespace.update(self.namespace)
+        namespace.update(kwargs)
+        Utils.exec_code(self.compiled, namespace)
+        execute = namespace["_tt_execute"]
+        # print execute,type(execute)
+        return execute()
+
+    def _compile_code(self, name, template_string, compress_whitespace):
+        """ 编译模版 """
+        # 对模版进行解析
+        body = _TemplateReader.parse_template(name, template_string, self)
+        # 解析后的资源存入file中等待编译
+        temp_file = _File(self, body)
+        # 创建内存buff
+        buffer = io.StringIO()
+        try:
+            writer = _CodeWriter(buffer, self, compress_whitespace)
+            temp_file.generate(writer)
+            self.compiled = compile(buffer.getvalue(), name, "exec", dont_inherit=True)
+        except Exception as e:
+            logging.exception("compile code error:%s", e)
+            raise
+        finally:
+            buffer.close()
+
+
+class _Node(object):
+    def generate(self, writer):
+        raise NotImplementedError()
+
+
+class _File(_Node):
+    def __init__(self, template, body):
+        self.template = template
+        self.body = body
+        self.line = 0
+
+    def generate(self, writer):
+        writer.write_line("def _tt_execute():", self.line)
+        with writer.indent():
+            writer.write_line("_tt_buffer = []", self.line)
+            writer.write_line("_tt_append = _tt_buffer.append", self.line)
+            self.body.generate(writer)
+            writer.write_line("return _tt_utf8('').join(_tt_buffer)", self.line)
+
+
+class _ChunkList(_Node):
+    def __init__(self, chunks):
+        self.chunks = chunks
+
+    def generate(self, writer):
+        for chunk in self.chunks:
+            chunk.generate(writer)
+
+
+class _ControlBlock(_Node):
+    def __init__(self, statement, line, body=None):
+        self.statement = statement
+        self.line = line
+        self.body = body
+
+    def generate(self, writer):
+        writer.write_line("%s:" % self.statement, self.line)
+        with writer.indent():
+            self.body.generate(writer)
+            # Just in case the body was empty
+            writer.write_line("pass", self.line)
+
+
+class _IntermediateControlBlock(_Node):
+    def __init__(self, statement, line):
+        self.statement = statement
+        self.line = line
+
+    def generate(self, writer):
+        # In case the previous block was empty
+        writer.write_line("pass", self.line)
+        writer.write_line("%s:" % self.statement, self.line, writer.indent_size() - 1)
+
+
+class _Statement(_Node):
+    def __init__(self, statement, line):
+        self.statement = statement
+        self.line = line
+
+    def generate(self, writer):
+        writer.write_line(self.statement, self.line)
+
+
+class _Expression(_Node):
+    def __init__(self, expression, line, raw=False):
+        self.expression = expression
+        self.line = line
+        self.raw = raw
+
+    def generate(self, writer):
+        writer.write_line("_tt_tmp = %s" % self.expression, self.line)
+        writer.write_line("_tt_tmp = _tt_utf8(_tt_tmp)", self.line)
+        # writer.write_line("if isinstance(_tt_tmp, (str,unicode)):"
+        #                  " _tt_tmp = _tt_utf8(_tt_tmp)", self.line)
+        # writer.write_line("else: _tt_tmp = _tt_utf8(str(_tt_tmp))", self.line)
+        if not self.raw and writer.current_template.autoescape is not None:
+            # In python3 functions like xhtml_escape return unicode,
+            # so we have to convert to utf8 again.
+            writer.write_line("_tt_tmp = _tt_utf8(%s(_tt_tmp))" %
+                              writer.current_template.autoescape, self.line)
+        writer.write_line("_tt_append(_tt_tmp)", self.line)
+
+
+class _Module(_Expression):
+    def __init__(self, expression, line):
+        super(_Module, self).__init__("_tt_modules." + expression, line, raw=True)
+
+
+class _Text(_Node):
+    def __init__(self, value, line):
+        self.value = value
+        self.line = line
+
+    def generate(self, writer):
+        value = self.value
+
+        # Compress lots of white space to a single character. If the whitespace
+        # breaks a line, have it continue to break a line, but just with a
+        # single \n character
+        if writer.compress_whitespace and "<pre>" not in value:
+            value = re.sub(r"([\t ]+)", " ", value)
+            value = re.sub(r"(\s*\n\s*)", "\n", value)
+
+        if value:
+            writer.write_line('_tt_append(%r)' % Utils.to_utf8(value), self.line)
+
+
+class ParseError(Exception):
+    """Raised for template syntax errors."""
+    pass
+
+
+class _CodeWriter(object):
+    def __init__(self, file, current_template, compress_whitespace):
+        self.file = file
+        self.current_template = current_template
+        self.compress_whitespace = compress_whitespace
+        self._indent = 0
+
+    def indent_size(self):
+        return self._indent
+
+    def indent(self):
+        this = self
+
+        class indent_context(object):
+            def __enter__(self):
+                this._indent += 1
+                return this
+
+            def __exit__(self, *args):
+                assert this._indent > 0
+                this._indent -= 1
+
+        return indent_context()
+
+    def write_line(self, line, line_number, indent=None):
+        if indent is None:
+            indent = self._indent
+        line_comment = '  # %s:%d' % (self.current_template.name, line_number)
+        # print("    " * indent + line + line_comment,self.file)
+        self.file.write("    " * indent + line + line_comment + "\r\n")
+
+
+class _TemplateReader(object):
+    def __init__(self, name, text):
+        self.name = name
+        self.text = text
+        self.line = 1
+        self.pos = 0
+
+    def find(self, needle, start=0, end=None):
+        assert start >= 0, start
+        pos = self.pos
+        start += pos
+        if end is None:
+            index = self.text.find(needle, start)
+        else:
+            end += pos
+            assert end >= start
+            index = self.text.find(needle, start, end)
+        if index != -1:
+            index -= pos
+        return index
+
+    def consume(self, count=None):
+        if count is None:
+            count = len(self.text) - self.pos
+        new_pos = self.pos + count
+        self.line += self.text.count("\n", self.pos, new_pos)
+        s = self.text[self.pos:new_pos]
+        self.pos = new_pos
+        return s
+
+    def remaining(self):
+        return len(self.text) - self.pos
+
+    def __len__(self):
+        return self.remaining()
+
+    def __getitem__(self, key):
+        if type(key) is slice:
+            size = len(self)
+            start, stop, step = key.indices(size)
+            if start is None:
+                start = self.pos
+            else:
+                start += self.pos
+            if stop is not None:
+                stop += self.pos
+            return self.text[slice(start, stop, step)]
+        elif key < 0:
+            return self.text[key]
+        else:
+            return self.text[self.pos + key]
+
+    def __str__(self):
+        return self.text[self.pos:]
+
+    @staticmethod
+    def parse_template(name, text, template):
+        return _TemplateReader._parse(_TemplateReader(name, text), template)
+
+    @staticmethod
+    def _parse(reader, template, in_block=None, in_loop=None):
+        body = _ChunkList([])
+        while True:
+            # Find next template directive
+            curly = 0
+            while True:
+                curly = reader.find("{", curly)
+                if curly == -1 or curly + 1 == reader.remaining():
+                    # EOF
+                    if in_block:
+                        raise ParseError("Missing {%% end %%} block for %s" %
+                                         in_block)
+                    body.chunks.append(_Text(reader.consume(), reader.line))
+                    return body
+                # If the first curly brace is not the start of a special token,
+                # start searching from the character after it
+                if reader[curly + 1] not in ("{", "%", "#"):
+                    curly += 1
+                    continue
+                # When there are more than 2 curlies in a row, use the
+                # innermost ones.  This is useful when generating languages
+                # like latex where curlies are also meaningful
+                if (curly + 2 < reader.remaining() and
+                        reader[curly + 1] == '{' and reader[curly + 2] == '{'):
+                    curly += 1
+                    continue
+                break
+
+            # Append any text before the special token
+            if curly > 0:
+                cons = reader.consume(curly)
+                body.chunks.append(_Text(cons, reader.line))
+
+            start_brace = reader.consume(2)
+            line = reader.line
+
+            # Template directives may be escaped as "{{!" or "{%!".
+            # In this case output the braces and consume the "!".
+            # This is especially useful in conjunction with jquery templates,
+            # which also use double braces.
+            if reader.remaining() and reader[0] == "!":
+                reader.consume(1)
+                body.chunks.append(_Text(start_brace, line))
+                continue
+
+            # Comment
+            if start_brace == "{#":
+                end = reader.find("#}")
+                if end == -1:
+                    raise ParseError("Missing end expression #} on line %d" % line)
+                reader.consume(end).strip()
+                reader.consume(2)
+                continue
+
+            # Expression
+            if start_brace == "{{":
+                end = reader.find("}}")
+                if end == -1:
+                    raise ParseError("Missing end expression }} on line %d" % line)
+                contents = reader.consume(end).strip()
+                reader.consume(2)
+                if not contents:
+                    raise ParseError("Empty expression on line %d" % line)
+                body.chunks.append(_Expression(contents, line))
+                continue
+
+            # Block
+            assert start_brace == "{%", start_brace
+            end = reader.find("%}")
+            if end == -1:
+                raise ParseError("Missing end block %%} on line %d" % line)
+            contents = reader.consume(end).strip()
+            reader.consume(2)
+            if not contents:
+                raise ParseError("Empty block tag ({%% %%}) on line %d" % line)
+
+            operator, space, suffix = contents.partition(" ")
+            suffix = suffix.strip()
+
+            # Intermediate ("else", "elif", etc) blocks
+            intermediate_blocks = {
+                "else": {"if", "for", "while", "try"},
+                "elif": {"if"},
+                "except": {"try"},
+                "finally": {"try"},
+            }
+            allowed_parents = intermediate_blocks.get(operator)
+            if allowed_parents is not None:
+                if not in_block:
+                    raise ParseError("%s outside %s block" %
+                                     (operator, allowed_parents))
+                if in_block not in allowed_parents:
+                    raise ParseError("%s block cannot be attached to %s block" % (operator, in_block))
+                body.chunks.append(_IntermediateControlBlock(contents, line))
+                continue
+
+            # End tag
+            elif operator == "end":
+                if not in_block:
+                    raise ParseError("Extra {%% end %%} block on line %d" % line)
+                return body
+
+            elif operator in ("set", "autoescape", "raw", "module"):
+                block = None
+                if operator == "set":
+                    if not suffix:
+                        raise ParseError("set missing statement on line %d" % line)
+                    block = _Statement(suffix, line)
+                elif operator == "autoescape":
+                    fn = suffix.strip()
+                    if fn == "None":
+                        fn = None
+                    template.autoescape = fn
+                    continue
+                elif operator == "raw":
+                    block = _Expression(suffix, line, raw=True)
+                elif operator == "module":
+                    block = _Module(suffix, line)
+                if block:
+                    body.chunks.append(block)
+                continue
+
+            elif operator in ("try", "if", "for", "while"):
+                # parse inner body recursively
+                if operator in ("for", "while"):
+                    block_body = _TemplateReader._parse(reader, template, operator, operator)
+                else:
+                    block_body = _TemplateReader._parse(reader, template, operator, in_loop)
+
+                block = _ControlBlock(contents, line, block_body)
+                body.chunks.append(block)
+                continue
+
+            elif operator in ("break", "continue"):
+                if not in_loop:
+                    raise ParseError("%s outside %s block" % (operator, {"for", "while"}))
+                body.chunks.append(_Statement(contents, line))
+                continue
+
+            else:
+                raise ParseError("unknown operator: %r" % operator)
+
+
 # 保存上传的文件类
 class UploadFile:
     def __init__(self, filename, filetype, filedata):
@@ -240,7 +679,7 @@ class HttpConfig:
         self.max_buff_size = 1024 * 1024 * 10
 
     def bind_runtime(self, name, runtime):
-        if not isinstance(runtime, AntRuntime):
+        if not isinstance(runtime, Runtime):
             raise ValueError("runtime must be an instance of AntRuntime")
         self.namespace[name] = runtime
 
@@ -263,24 +702,24 @@ class HttpConfig:
         self.logger_level = level
 
 
-class AntRuntime:
+class Runtime:
     def __init__(self):
         pass
 
     def debug(self, msg, *args):
-        pass
+        logging.debug(msg, *args)
 
     def info(self, msg, *args):
-        pass
+        logging.info(msg, *args)
 
     def warning(self, msg, *args):
-        pass
+        logging.warning(msg, *args)
 
     def error(self, msg, *args):
-        pass
+        logging.error(msg, *args)
 
     def exception(self, msg, *args):
-        pass
+        logging.exception(msg, *args)
 
 
 class Response:
@@ -386,6 +825,7 @@ class FileResponse(Response):
         with open(self.file_path, "r") as fp:
             for line in fp:
                 session.write(line)
+
 
 class Request:
     def __init__(self):
@@ -819,11 +1259,45 @@ class BaseRequestHandler:
         self.response.set_status(code, msg)
         self.write(body)
 
+    def get(self):
+        self.write_error(405)
+
+    def post(self):
+        self.write_error(405)
+
+    def head(self):
+        self.write_error(400)
 
 class RequestHandler(BaseRequestHandler):
     def __init__(self, session:Session, request:Request):
         super().__init__(session, request)
         self.response = Response()
+        self.ui = {}
+
+    def redirect(self, url, code=None):
+        """
+        重定向URL，来自bottle的方式，原来我的写法是直接发一个html中带有脚本，执行location.href 赋值跳转
+        :param url:
+        :param code:
+        :return:
+        """
+        if not code:
+            code = 303 if self.request.version == "HTTP/1.1" else 302
+        self.response.set_status(code)
+        self.response.set_header("Location", url)
+
+    def render(self, file, **kwargs):
+        filename = os.path.join(Application.ins().template_path, file)
+        if not os.path.exists(filename):
+            raise FileExistsError("{0} not found".format(filename))
+        if not os.path.isfile(filename):
+            raise FileNotFoundError("{0} not file".format(filename))
+        with open(filename, "r", encoding="utf-8") as fp:
+            self.render_string(fp.read(), filename, **kwargs)
+
+    def render_string(self, html, name, **kwargs):
+        t = Template(html, name, self.ui)
+        self.write(t.generate(**kwargs))
 
 
 class StaticFileHandler(BaseRequestHandler):
@@ -1089,6 +1563,10 @@ class Application:
         return self.config.upload_path
 
     @property
+    def template_path(self):
+        return self.config.template_path
+
+    @property
     def max_buff_size(self):
         return self.config.max_buff_size
 
@@ -1102,8 +1580,33 @@ class Application:
             return StaticFileHandler
         return self.routes.get(path, None)
 
+    def load_all_scripts(self):
+        # 加载所有的脚本
+        for root, dirs, files in os.walk(self.config.script_path):
+            for file in files:
+                if not file.endswith(".py"):
+                    continue
+                # 读取文件内容，编译生成模板
+                filename = os.path.join(root, file)
+                if not os.path.isfile(filename):
+                    continue
+                with open(filename, "rb") as fp:
+                    code = fp.read()
+                code_obj = compile(code, filename, "exec")
+                # 创建一个新的模块，然后在模块的__dict__中执行
+                module_name = os.path.splitext(filename)[0]
+                dynamic_module = types.ModuleType(module_name)
+                dynamic_module.__dict__.update(self.config.namespace)
+                exec(code_obj, dynamic_module.__dict__)
+                # 在全局globals中执行
+                # exec(code_obj, globals(), self.config.namespace)
+
     def start_server(self, config:HttpConfig, host="127.0.0.1", port=8080):
         self.config = config
+        if self.config.script_path and os.path.exists(self.config.script_path):
+            sys.path.append(self.config.script_path)
+            self.load_all_scripts()
+
         server = HttpServer(host, port)
         server.start()
 
@@ -1119,3 +1622,7 @@ def route(path):
 def start_server(config:HttpConfig, host="127.0.0.1", port=8080):
     # 启动HTTP服务器
     Application.ins().start_server(config, host, port)
+
+
+def reload():
+    Application.ins().load_all_scripts()
