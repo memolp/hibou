@@ -9,8 +9,8 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="ant",
+    name="hibou",
     version="1.0.0",
     author="Jeff Xun",
-    py_modules= ["ant"])
+    py_modules= ["hibou"])
 

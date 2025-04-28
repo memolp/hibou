@@ -1,10 +1,10 @@
 # -*- coding:utf-8 -*-
 
-import ant
+import hibou
 
 
-@ant.route("/login")
-class LoginHandler(ant.RequestHandler):
+@hibou.route("/login")
+class LoginHandler(hibou.RequestHandler):
     def get(self):
         return self.render("login.html")
 

@@ -1,8 +1,8 @@
 # -*- coding:utf-8 -*-
 
-import ant
+import hibou
 
-class BaseHandler(ant.RequestHandler):
+class BaseHandler(hibou.RequestHandler):
     def check_auth(self):
         """ 检查用户是否登录 """
         if not self.get_cookie("UUID"):
