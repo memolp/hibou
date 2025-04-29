@@ -675,7 +675,7 @@ class HttpConfig:
         self.script_path = None
         self.template_path = None
         self.support_static_cache = True
-        self.support_chunk = True
+        self.support_chunk = False
         self.max_buff_size = 1024 * 1024 * 10
 
     def bind_runtime(self, name, runtime):
@@ -705,21 +705,6 @@ class HttpConfig:
 class Runtime:
     def __init__(self):
         pass
-
-    def debug(self, msg, *args):
-        logging.debug(msg, *args)
-
-    def info(self, msg, *args):
-        logging.info(msg, *args)
-
-    def warning(self, msg, *args):
-        logging.warning(msg, *args)
-
-    def error(self, msg, *args):
-        logging.error(msg, *args)
-
-    def exception(self, msg, *args):
-        logging.exception(msg, *args)
 
 
 class Response:
@@ -822,9 +807,12 @@ class FileResponse(Response):
             return self.write_with_range(session)
         if self.using_chunk:
             return self.write_with_chunk(session)
-        with open(self.file_path, "r") as fp:
-            for line in fp:
-                session.write(line)
+        with open(self.file_path, "rb") as fp:
+            while True:
+                data = fp.read(Application.ins().max_buff_size)
+                if not data:
+                    break
+                session.write_raw(data)
 
 
 class Request:
@@ -839,13 +827,18 @@ class Request:
         self.files = {}
 
     def get_header(self, name):
-        return self.headers.get(name, None)
+        return self.headers.get(name.lower(), None)
 
     def get_cookie(self, name):
         return self.cookies.get(name, None)
 
     def get_argument(self, name, default=None):
-        return self.arguments.get(name, default)
+        values = self.arguments.get(name, None)
+        if not values:
+            return default
+        if isinstance(values, list):
+            return values[0]
+        return values
 
     def __str__(self):
         return f"Request(method={self.method}, path={self.path})"
@@ -864,6 +857,10 @@ class Session:
         self.read_fd = client_sock.makefile("rb")
         self.write_fd = client_sock.makefile("wb")
         self.raw_buffer = Buffer(self.session_id, self.DEFAULT_MEMORY_SIZE)
+
+    @property
+    def remote_ip(self):
+        return self.client_sock.getpeername()[0]
 
     def read(self, size):
         # 读取指定大小字节的数据
@@ -893,11 +890,13 @@ class Session:
 
     def close(self):
         try:
-            self.write_fd.close()
-            self.read_fd.close()
+            # self.write_fd.close()
+            # self.read_fd.close()
+            self.client_sock.close()
+        except socket.error as e:
+            logging.error("close session:%s error:%s", self.session.session_id, e.errno)
         except Exception as e:
             logging.exception("Error closing session: %s", e)
-        self.client_sock.close()
 
 
 class RequestParseException(Exception):
@@ -927,7 +926,9 @@ class SessionHandler:
         route_path = self.request.path
         method_name = self.request.method
         handler_cls = Application.ins().match_route(route_path)
+        logging.debug("request url:%s method:%s", route_path, method_name)
         if handler_cls is None or not issubclass(handler_cls, BaseRequestHandler):
+            logging.error("request url:%s not found", route_path)
             raise RequestParseException(400, "Bad Request")
         handler = handler_cls(self.session, self.request)
         if not hasattr(handler, method_name):
@@ -946,6 +947,8 @@ class SessionHandler:
             await response.send_header(self.session)
             await response.send_body(self.session)
             self.session.finish()
+        except socket.error as e:
+            logging.error("do_response session:%s error:%s", self.session.session_id, e.errno)
         except Exception as e:
             logging.exception("Error sending response: %s", e)
 
@@ -1032,26 +1035,29 @@ class SessionHandler:
     async def parse_body(self):
         # 解析请求体
         # 在某些类型的HTTP请求（如 POST 和 PUT）中，请求体包含要发送给服务器的数据。
-        content_length = self.request.get_header("content-length")
+        content_length = self.request.get_header("Content-Length")
         if content_length:  # 前端在请求头里面指定了请求体的大小
             content_length = int(content_length)
             buffer = await self.read_content(content_length)
             if not buffer or not isinstance(buffer, Buffer):
                 raise RequestParseException(400, "Bad Request")
+            buffer.flip()
             self.request.body = buffer
         else:
             # 前端在请求头里面指定了Transfer-Encoding: chunked，采用chunk上传数据
-            tc = self.request.get_header("transfer-encoding")
+            tc = self.request.get_header("Transfer-Encoding")
             if tc and tc.lower() == "chunked":
                 buffer = await self.read_chunked()
                 if not buffer or not isinstance(buffer, Buffer):
                     raise RequestParseException(400, "Bad Request")
+                buffer.flip()
                 self.request.body = buffer
             else:
                 # 都没有那么就按行读取到结束
                 buffer = await self.read_body()
                 if not buffer or not isinstance(buffer, Buffer):
                     raise RequestParseException(400, "Bad Request")
+                buffer.flip()
                 self.request.body = buffer
 
     async def read_chunked(self):
@@ -1101,7 +1107,7 @@ class SessionHandler:
     def do_parse_cookies(self):
         # 解析cookie
         # 其中cookie的格式为：name1=value1; name2=value2; name3=value3
-        cookies = self.request.get_header("cookie")
+        cookies = self.request.get_header("Cookie")
         if not cookies:
             return
         cookies = cookies.split(";")
@@ -1124,7 +1130,7 @@ class SessionHandler:
         # multipart/form-data 格式则比较特殊
         # Content-Type: text/html; charset=utf-8
         # Content-Type: multipart/form-data; boundary=something
-        content_type = self.request.get_header("content-type")
+        content_type = self.request.get_header("Content-Type")
         if not content_type:
             return
         ctype, params = cgi.parse_header(content_type)
@@ -1231,7 +1237,7 @@ class SessionHandler:
             # 不是文件，则直接读取出里面的内容
             value = io.BytesIO()
             line = self.read_multipart_form_value(buffer, value, split_boundary)
-            self.request.arguments[value] = value.getvalue().decode("utf-8")
+            self.request.arguments.setdefault(name, []).append(value.getvalue().decode("utf-8"))
             if line.startswith(final_boundary): # 结束
                 return False
             return True
@@ -1240,7 +1246,7 @@ class SessionHandler:
         value = Buffer(temp_file_path)
         line = self.read_multipart_form_value(buffer, value, split_boundary)
         #.setdefault(name, []).append(http_file) 暂时去掉同name的支持
-        self.request.files[name] = UploadFile(filename, form_headers.get("content-type"), value)
+        self.request.files.setdefault(name, []).append(UploadFile(filename, form_headers.get("content-type"), value))
         if line.startswith(final_boundary): # 结束
             return False
         return True
@@ -1327,7 +1333,7 @@ class StaticFileHandler(BaseRequestHandler):
         max_buff_size = Application.ins().max_buff_size
         if support_static_cache:
             if_modify_date = self.request.get_header("If-Modified-Since")
-            cache_control = self.request.get_header("Cache-control")
+            cache_control = self.request.get_header("Cache-Control")
             if not cache_control or cache_control.find("no-cache") < 0:
                 file_modify_date = self.file_modify_date(file_path)
                 if if_modify_date and if_modify_date == file_modify_date and not use_range:
@@ -1545,6 +1551,8 @@ class Application:
         super().__init__()
         self.config = None  # type: HttpConfig or None
         self.routes = {}
+        self.system_start_handlers = {}
+        self.system_stop_handlers = {}
 
     @property
     def static_cache(self):
@@ -1606,9 +1614,26 @@ class Application:
         if self.config.script_path and os.path.exists(self.config.script_path):
             sys.path.append(self.config.script_path)
             self.load_all_scripts()
-
+        logging.debug("do system start call")
+        for name, handle in self.system_start_handlers.items():
+            handle()
         server = HttpServer(host, port)
         server.start()
+        logging.debug("do system stop call")
+        for name, handle in self.system_stop_handlers.items():
+            handle()
+
+    def add_system_start_handle(self, handle):
+        if not callable(handle):
+            raise TypeError("add_system_start_handle: {0} it not callable".format(handle))
+        name = handle.__name__
+        self.system_start_handlers[name] = handle
+
+    def add_system_stop_handle(self, handle):
+        if not callable(handle):
+            raise TypeError("add_system_stop_handle: {0} it not callable".format(handle))
+        name = handle.__name__
+        self.system_stop_handlers[name] = handle
 
 
 def route(path):
@@ -1626,3 +1651,39 @@ def start_server(config:HttpConfig, host="127.0.0.1", port=8080):
 
 def reload():
     Application.ins().load_all_scripts()
+
+
+def on_start():
+    # 程序启动时的回调注册
+    def decorator(method):
+        Application.ins().add_system_start_handle(method)
+        return method
+    return decorator
+
+
+def on_stop():
+    # 程序停止时的回调注册
+    def decorator(method):
+        Application.ins().add_system_stop_handle(method)
+        return method
+    return decorator
+
+
+def debug(msg, *args):
+    logging.debug(msg, *args)
+
+
+def info(msg, *args):
+    logging.info(msg, *args)
+
+
+def warning(msg, *args):
+    logging.warning(msg, *args)
+
+
+def error(msg, *args):
+    logging.error(msg, *args)
+
+
+def exception(msg, *args):
+    logging.exception(msg, *args)

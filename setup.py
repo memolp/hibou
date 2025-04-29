@@ -6,11 +6,12 @@
 2. 将pyd文件和其他依赖的py文件打包成whl包
 """
 
-from setuptools import setup, find_packages
+from setuptools import setup, extension
+from Cython.Build import cythonize
 
 setup(
     name="hibou",
     version="1.0.0",
     author="Jeff Xun",
-    py_modules= ["hibou"])
+    ext_modules= cythonize("hibou.py"))
 
