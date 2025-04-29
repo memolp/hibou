@@ -1,0 +1,2 @@
+include hibou/*.pyd
+include hibou/*.pyi
