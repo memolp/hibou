@@ -4,6 +4,7 @@ import asyncio
 import cgi
 import io
 import os
+import queue
 import re
 import selectors
 import socket
@@ -14,6 +15,7 @@ import logging
 import types
 import urllib.parse
 import uuid
+import threading
 
 
 RESPONSE_CODE_DEFINED = {
@@ -89,7 +91,7 @@ MINE_TYPE_DEFINED = {
     ".7z": "application/octet-stream",
     ".rar": "application/octet-stream",
     ".ipa": "application/vnd.iphone",
-    ".apk": "application/vnd.android.package-archive",
+    ".apk": "application/octet-stream",
 }
 
 
@@ -677,6 +679,8 @@ class HttpConfig:
         self.support_static_cache = True
         self.support_chunk = False
         self.max_buff_size = 1024 * 1024 * 10
+        self.backlog = 1024
+        self.max_thread = 2
 
     def bind_runtime(self, name, runtime):
         if not isinstance(runtime, Runtime):
@@ -744,20 +748,28 @@ class Response:
         else:
             raise ValueError("text must be str or bytes")
 
+    def _before_write_header(self):
+        # 提供一个在写入响应头前的处理方法
+        if "Content-Type" not in self.headers:
+            self.set_header("Content-Type", "text/html; charset=utf-8")
+        if "Date" not in self.headers:
+            self.set_header("Date", Utils.to_rfc822(time.localtime()))
+        if "Content-Length" not in self.headers:
+            self.set_header("Content-Length", self.body.tell())
+
     async def send_header(self, session):
         if self.version == "HTTP/0.9":
             return
+        self._before_write_header() # 发送前提供一个处理的接口
+        # 写入响应结果
         session.write("{0} {1} {2}\r\n".format(self.version, self.status_code, self.msg))
+        # 写入响应头
         for name, value in self.headers.items():
             session.write("{0}: {1}\r\n".format(name, value))
-        if "Content-Type" not in self.headers:
-            session.write("Content-Type: text/html; charset=utf-8\r\n")
-        if "Date" not in self.headers:
-            session.write("{0}: {1}\r\n".format("Date", Utils.to_rfc822(time.localtime())))
-        if "Content-Length" not in self.headers:
-            session.write("Content-Length: {0}\r\n".format(self.body.tell()))
+        # 写入Cookies
         for value in self.cookies.values():
             session.write("Set-Cookie: : {0}\r\n".format(value))
+        # 头写入完成
         session.write("\r\n")
 
     async def send_body(self, session):
@@ -774,6 +786,13 @@ class FileResponse(Response):
         self.using_chunk = False
         self.using_range = False
         self.range = None
+
+    def _before_write_header(self):
+        super()._before_write_header()
+        if self.file_path:
+            self.set_header("Content-Disposition", "attachment; filename={0}".format(os.path.basename(self.file_path)))
+        if self.using_chunk:
+            self.headers.pop("Content-Length", None)
 
     def write_with_chunk(self, session):
         with open(self.file_path, "rb") as fp:
@@ -853,7 +872,7 @@ class Session:
         super().__init__()
         self.client_sock = client_sock
         self.session_id = uuid.uuid4().hex
-        self.close_connection = True
+        self.closed = False
         self.read_fd = client_sock.makefile("rb")
         self.write_fd = client_sock.makefile("wb")
         self.raw_buffer = Buffer(self.session_id, self.DEFAULT_MEMORY_SIZE)
@@ -874,27 +893,45 @@ class Session:
         # 读取一行数据
         try:
             line = self.read_fd.readline()
+            if not line:
+                self.closed = True
+                return None
             return line.decode()
+        except socket.error as e:
+            if e.errno == 10053:
+                pass
         except Exception as e:
             logging.exception("Error reading line: %s", e)
         return None
 
     def write(self, text:str):
-        self.write_fd.write(text.encode("utf-8"))
+        if self.closed:
+            return
+        try:
+            self.write_fd.write(text.encode("utf-8"))
+        except socket.error as e:
+            if e.errno == 10053:
+                self.closed = True
 
     def write_raw(self, raw:bytes):
-        self.write_fd.write(raw)
+        if self.closed:
+            return
+        try:
+            self.write_fd.write(raw)
+        except socket.error as e:
+            if e.errno == 10053:
+                self.closed = True
 
     def finish(self):
+        if self.closed:
+            return
         self.write_fd.flush()
 
     def close(self):
         try:
-            # self.write_fd.close()
-            # self.read_fd.close()
             self.client_sock.close()
         except socket.error as e:
-            logging.error("close session:%s error:%s", self.session.session_id, e.errno)
+            logging.error("close session:%s error:%s", self.session_id, e.errno)
         except Exception as e:
             logging.exception("Error closing session: %s", e)
 
@@ -944,6 +981,10 @@ class SessionHandler:
         if not isinstance(response, Response):
             raise RequestParseException(500, "Server Error")
         try:
+            if self.close_connection:
+                response.set_header("Connection", "close")
+            else:
+                response.set_header("Connection", "keep-alive")
             await response.send_header(self.session)
             await response.send_body(self.session)
             self.session.finish()
@@ -954,11 +995,16 @@ class SessionHandler:
 
     async def do_default_response(self, code, message=""):
         # 处理响应
+        self.close_connection = True
         if self.request.version == "HTTP/0.9":
             return
         self.session.write("{0} {1} {2}\r\n".format(self.request.version, code, RESPONSE_CODE_DEFINED.get(code, "Server Error")))
         self.session.write("Content-Type: text/html; charset=utf-8\r\n")
         self.session.write("Date: {0}\r\n".format(Utils.to_rfc822(time.localtime())))
+        if self.close_connection:
+            self.session.write("Connection: close\r\n")
+        else:
+            self.session.write("Connection: keep-alive\r\n")
         if message:
             self.session.write("Content-Length: {0}\r\n".format(len(message)))
         self.session.write("\r\n")
@@ -975,6 +1021,16 @@ class SessionHandler:
                 await self.parse_body()
         # 最后解析参数，因为post的参数在body里面，需要先处理body
         self.do_parse_args()
+        if not self.close_connection:
+            # POST请求的链接先不复用
+            if self.request.method == "post":
+                self.close_connection = True
+                return
+            # 客户端没有提供keep-alive的也不复用
+            keep_alive = self.request.get_header("Connection")
+            if not keep_alive or keep_alive.lower() == "close":
+                self.close_connection = True
+                return
 
     async def parse_method(self):
         # 解析请求行  （Request Line）：
@@ -1003,7 +1059,7 @@ class SessionHandler:
             version_number = int(version_number[0]), int(version_number[1])
             # 版本大于等于HTTP/1.1时，支持持续链接
             if version_number >= (1, 1):
-                self.session.close_connection = False
+                self.close_connection = False
             # 目前不支持http/2的版本
             if version_number >= (2, 0):
                 raise RequestParseException(400, "Bad Request")
@@ -1274,6 +1330,7 @@ class BaseRequestHandler:
     def head(self):
         self.write_error(400)
 
+
 class RequestHandler(BaseRequestHandler):
     def __init__(self, session:Session, request:Request):
         super().__init__(session, request)
@@ -1408,9 +1465,9 @@ class StaticFileHandler(BaseRequestHandler):
         """
         # 对url进行解码，有可能有带空格的文件之类的
         path = urllib.parse.unquote(self.request.path)
-        if not path.startswith("/static"):
+        if not path.startswith("/static/"):
             return None
-        path = path[len("/static"):]
+        path = path[len("/static/"):]
         url_route_path = path if not path.startswith("/") else path[1:]
         file_path = os.path.join(Application.ins().static_path, url_route_path)
         if not os.path.isfile(file_path) or not os.path.exists(file_path):
@@ -1460,6 +1517,41 @@ class StaticFileHandler(BaseRequestHandler):
         return MINE_TYPE_DEFINED.get(filename[dot_index:], "application/octet-stream")
 
 
+class ThreadLoopPool:
+    def __init__(self, max_work=2):
+        self.max_work = max_work
+        self.active_thread = []
+        self.task_queue = queue.Queue()
+        self._shutdown = False
+
+    def thread_void(self):
+        loop = asyncio.new_event_loop()
+        while not self._shutdown:
+            try:
+                if self.task_queue.empty():
+                    time.sleep(0.001)
+                    continue
+                task = self.task_queue.get(False, 1)
+                if not task:
+                    continue
+                fn, params = task[0], task[1]
+                fn(loop, *params)
+            except Exception as e:
+                logging.exception("run task error:%s", e)
+
+    def submit(self, fn, *params):
+        size = len(self.active_thread)
+        if size < self.max_work:
+            p = threading.Thread(target=self.thread_void, args=())
+            p.start()
+            self.active_thread.append(p)
+        task = [fn, params]
+        self.task_queue.put(task)
+
+    def shutdown(self):
+        self._shutdown = True
+
+
 class HttpServer:
     def __init__(self, host='127.0.0.1', port=8080):
         self.host = host
@@ -1468,12 +1560,13 @@ class HttpServer:
         self.server_socket = None
         self.routes = {}
         self.session_map = {}
+        self.thread_pool = ThreadLoopPool(Application.ins().max_thread)
 
     def create_server_socket(self):
         # 启动HTTP服务器
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.bind((self.host, self.port))
-        self.server_socket.listen(5)
+        self.server_socket.listen(Application.ins().backlog)
         self.selector.register(self.server_socket, selectors.EVENT_READ, self.accept)
         logging.debug(f"Server started at {self.host}:{self.port}")
 
@@ -1488,10 +1581,11 @@ class HttpServer:
                 for key, _ in events:
                     callback = key.data
                     callback(key.fileobj)
-                await asyncio.sleep(0.1)
+                # await asyncio.sleep(0.001)
         except KeyboardInterrupt:
             logging.debug("Server shutting down...")
         finally:
+            self.thread_pool.shutdown()
             self.server_socket.close()
 
     def accept(self, server_socket):
@@ -1505,12 +1599,20 @@ class HttpServer:
 
     def read(self, client_socket):
         self.selector.unregister(client_socket)
+        client_socket.setblocking(True)     # 为了减少write的设计复杂度，这里直接进行切换了socket的阻塞模式。
         session = self.session_map.get(client_socket, None)
         if session is None:
             session = Session(client_socket)
             self.session_map[client_socket] = session
-        loop = asyncio.get_event_loop()
-        loop.create_task(self.handle_session(session))
+        # loop = asyncio.get_event_loop()
+        # loop.create_task(self.handle_session(session))
+        self.thread_pool.submit(self.handle_task, session)
+
+    def handle_task(self, loop:asyncio.AbstractEventLoop, session:Session):
+        try:
+            loop.run_until_complete(self.handle_session(session))
+        except Exception as e:
+            logging.exception("handle task error:%s", e)
 
     async def handle_session(self, session:Session):
         handler = SessionHandler(session)
@@ -1520,20 +1622,21 @@ class HttpServer:
             logging.debug(f"Session {session.session_id} closed")
             self.session_map.pop(session.client_sock)
         else:
+            session.client_sock.setblocking(False)
             self.selector.register(session.client_sock, selectors.EVENT_READ, self.read)
 
 
 class HttpSSLServer(HttpServer):
-    def __init__(self, host, port, certfile, keyfile):
+    def __init__(self, host, port, cert_file, keyfile):
         super().__init__(host, port)
-        self.certfile = certfile
+        self.cert_file = cert_file
         self.keyfile = keyfile
 
     def create_server_socket(self):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.bind((self.host, self.port))
-        self.server_socket.listen(5)
-        self.server_socket = ssl.wrap_socket(self.server_socket, certfile=self.certfile, keyfile=self.keyfile, server_side=True)
+        self.server_socket.listen(Application.ins().backlog)
+        self.server_socket = ssl.wrap_socket(self.server_socket, certfile=self.cert_file, keyfile=self.keyfile, server_side=True)
         logging.info(f"SSL Server started at {self.host}:{self.port}")
 
 
@@ -1578,13 +1681,21 @@ class Application:
     def max_buff_size(self):
         return self.config.max_buff_size
 
+    @property
+    def backlog(self):
+        return self.config.backlog
+
+    @property
+    def max_thread(self):
+        return self.config.max_thread
+
     def add_route(self, path, handler_cls):
         if not issubclass(handler_cls, BaseRequestHandler):
             raise ValueError("handler_cls must be a subclass of BaseRequestHandler")
         self.routes[path] = handler_cls
 
     def match_route(self, path):
-        if path.startswith("/static"):
+        if path.startswith("/static/"):
             return StaticFileHandler
         return self.routes.get(path, None)
 
