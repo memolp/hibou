@@ -2,6 +2,7 @@
 
 import asyncio
 import cgi
+import importlib
 import io
 import os
 import queue
@@ -141,6 +142,48 @@ class Utils:
         if isinstance(data, str):
             return data.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#039;")
         return data
+
+    @staticmethod
+    def read_range(range_header:str):
+        """
+        解析请求头中的Range
+        :param range_header:
+        :return: 开始和结束位置，异常则返回空
+        """
+        unit, _, value = range_header.partition("=")
+        unit, value = unit.strip(), value.strip()
+        if unit != "bytes":
+            return None
+        start_b, _, end_b = value.partition("-")
+        start = Utils.int_or_none(start_b)
+        end = Utils.int_or_none(end_b)
+
+        if end is not None:
+            if start is None:
+                if end != 0:
+                    start = -end
+                    end = None
+            else:
+                end += 1
+        return start, end
+
+    @staticmethod
+    def file_modify_date(file_path):
+        """
+        获取文件的最后修改时间
+        :param file_path:
+        :return:
+        """
+        file_mt = time.localtime(os.stat(file_path).st_mtime)
+        return Utils.to_rfc822(file_mt)
+
+    @staticmethod
+    def get_file_mime_type(filename):
+        """ 根据文件扩展名获取文件类型 """
+        dot_index = filename.rfind(".")
+        if dot_index < 0:
+            return "application/octet-stream"
+        return MINE_TYPE_DEFINED.get(filename[dot_index:], "application/octet-stream")
 
 
 class Buffer:
@@ -678,14 +721,19 @@ class HttpConfig:
         self.template_path = None
         self.support_static_cache = True
         self.support_chunk = False
+        self.support_range = True
         self.max_buff_size = 1024 * 1024 * 10
         self.backlog = 1024
         self.max_thread = 2
+        self.runtime_global_params = {}
 
     def bind_runtime(self, name, runtime):
         if not isinstance(runtime, Runtime):
             raise ValueError("runtime must be an instance of AntRuntime")
         self.namespace[name] = runtime
+
+    def bind_param(self, name, symbol):
+        self.runtime_global_params[name] = symbol
 
     def static_path_root(self, path):
         self.static_path = path
@@ -780,22 +828,80 @@ class Response:
 
 
 class FileResponse(Response):
+    DEFAULT = 0x0
+    CHUNKED = 0x1
+    RANGE = 0x2
+
     def __init__(self):
         super().__init__()
-        self.file_path = None
-        self.using_chunk = False
-        self.using_range = False
-        self.range = None
+        self._file_path = None
+        self._range = None
+        self._file_size = 0
+        self._using_mode = FileResponse.DEFAULT
+        self._include_body = True
+
+    def set_file(self, filepath:str, mine_type:str):
+        self._file_path = filepath
+        self._file_size = os.path.getsize(filepath)
+        self.set_header("Content-Type", mine_type)
+
+    def only_header(self):
+        self._include_body = False
+
+    def enable_range(self, request_range:str):
+        if not Application.ins().range_support:
+            return
+        max_buff_size = Application.ins().max_buff_size
+        start, end = Utils.read_range(request_range)
+        if start is None and end is None:
+            self.set_header("Content-Range", "bytes */%s" % (self._file_size,))
+            self.set_status(416)
+            return
+        if start is not None and start >= self._file_size:
+            self.set_header("Content-Range", "bytes */%s" % (self._file_size,))
+            self.set_status(416)
+            return
+        if end is not None and end >= self._file_size:
+            self.set_header("Content-Range", "bytes */%s" % (self._file_size,))
+            self.set_status(416)
+            return
+        # Range: -1024表示从资源末尾往前读取1024个字节的内容
+        if start is None and end is not None:
+            start = self._file_size - end
+        # Range: 0- 表示从资源开始到末尾，为了防止资源过大，这里并不一定需要一次性将全部读取返回
+        if end is None:
+            end = self._file_size - 1
+        read_size = end - start + 1
+        if read_size > max_buff_size:
+            read_size = max_buff_size
+            end = read_size + start - 1
+        self.set_header("Content-Range", "bytes %s-%s/%s" % (start, end, self._file_size))
+        self.set_header("Content-Length", read_size)
+        self.set_status(206)
+        self._using_mode = FileResponse.RANGE
+        self._range = [start, end]
+
+    def enable_trunked(self):
+        if Application.ins().chunk_support:
+            self._using_mode = FileResponse.CHUNKED
 
     def _before_write_header(self):
         super()._before_write_header()
-        if self.file_path:
-            self.set_header("Content-Disposition", "attachment; filename={0}".format(os.path.basename(self.file_path)))
-        if self.using_chunk:
-            self.headers.pop("Content-Length", None)
+        # 对于开启了缓存的，只会发304过去，不会有body，因此不需要将Content-Length发过去，否则会导致浏览器出异常
+        if not self._file_path:
+            return
+        self.set_header("Content-Disposition", "attachment; filename={0}".format(os.path.basename(self._file_path)))
+        # 使用chunked 发送数据，不需要设置Content-Length
+        if self._using_mode == FileResponse.CHUNKED:
+            self.set_header("Transfer-Encoding", "chunked")
+            return
+        elif self._using_mode == FileResponse.RANGE and self._range:
+            pass
+        else:
+            self.set_header("Content-Length", self._file_size)
 
     def write_with_chunk(self, session):
-        with open(self.file_path, "rb") as fp:
+        with open(self._file_path, "rb") as fp:
             while True:
                 chunk = fp.read(Application.ins().max_buff_size)
                 if not chunk:
@@ -812,21 +918,21 @@ class FileResponse(Response):
         session.write("\r\n")
 
     def write_with_range(self, session):
-        start_pos = self.range[0]
-        size = self.range[1]
-        with open(self.file_path, "rb") as fp:
+        start_pos = self._range[0]
+        size = self._range[1]
+        with open(self._file_path, "rb") as fp:
             fp.seek(start_pos, io.SEEK_SET)
             chunk = fp.read(size)
             session.write_raw(chunk)
 
     async def send_body(self, session):
-        if not self.file_path:
+        if not self._file_path:
             return
-        if self.using_range and self.range:
-            return self.write_with_range(session)
-        if self.using_chunk:
+        if self._using_mode == FileResponse.CHUNKED:
             return self.write_with_chunk(session)
-        with open(self.file_path, "rb") as fp:
+        elif self._using_mode == FileResponse.RANGE and self._range:
+            return self.write_with_range(session)
+        with open(self._file_path, "rb") as fp:
             while True:
                 data = fp.read(Application.ins().max_buff_size)
                 if not data:
@@ -841,6 +947,7 @@ class Request:
         self.headers = {}
         self.body = None        # type: Buffer or None
         self.version = "HTTP/1.1"
+        self.version_number = (1, 1)
         self.cookies = {}
         self.arguments = {}
         self.files = {}
@@ -884,7 +991,10 @@ class Session:
     def read(self, size):
         # 读取指定大小字节的数据
         try:
-            return self.read_fd.read(size)
+            data = self.read_fd.read(size)
+            if not data:
+                self.closed = True
+            return data
         except Exception as e:
             logging.exception("Error reading data: %s", e)
         return None
@@ -909,6 +1019,7 @@ class Session:
             return
         try:
             self.write_fd.write(text.encode("utf-8"))
+            self.write_fd.flush()
         except socket.error as e:
             if e.errno == 10053:
                 self.closed = True
@@ -918,6 +1029,7 @@ class Session:
             return
         try:
             self.write_fd.write(raw)
+            self.write_fd.flush()
         except socket.error as e:
             if e.errno == 10053:
                 self.closed = True
@@ -941,6 +1053,11 @@ class RequestParseException(Exception):
         super().__init__()
         self.code = code
         self.msg = msg
+        
+
+class RequestCloseException(Exception):
+    def __init__(self):
+        super().__init__()
 
 
 class SessionHandler:
@@ -956,6 +1073,8 @@ class SessionHandler:
         try:
             await self.do_parse()
             await self.do_method()
+        except RequestCloseException:
+            self.close_connection = True
         except RequestParseException as e:
             await self.do_default_response(e.code, e.msg)
 
@@ -963,7 +1082,7 @@ class SessionHandler:
         route_path = self.request.path
         method_name = self.request.method
         handler_cls = Application.ins().match_route(route_path)
-        logging.debug("request url:%s method:%s", route_path, method_name)
+        logging.debug("Session:%s request url:%s method:%s", self.session.session_id, route_path, method_name)
         if handler_cls is None or not issubclass(handler_cls, BaseRequestHandler):
             logging.error("request url:%s not found", route_path)
             raise RequestParseException(400, "Bad Request")
@@ -989,7 +1108,7 @@ class SessionHandler:
             await response.send_body(self.session)
             self.session.finish()
         except socket.error as e:
-            logging.error("do_response session:%s error:%s", self.session.session_id, e.errno)
+            logging.exception("do_response session:%s error:%s", self.session.session_id, e.errno)
         except Exception as e:
             logging.exception("Error sending response: %s", e)
 
@@ -1039,7 +1158,7 @@ class SessionHandler:
         # HTTP 版本：如 HTTP/1.1 或 HTTP/2。
         line = self.session.read_line()
         if not line or not line.endswith(self.HTTP_LRE):
-            raise RequestParseException(400, "Bad Request")
+            raise RequestCloseException()
         params = line.split()
         params_size = len(params)
         # HTTP/0.9
@@ -1047,26 +1166,28 @@ class SessionHandler:
             method, path = params
             if method.upper() != "GET":
                 raise RequestParseException(400, "Bad Request")
-            self.request.version = "HTTP/0.9"
+            version = "HTTP/0.9"
         elif params_size == 3:
             method, path, version = params
-            if version[0:5] != "HTTP/":
-                raise RequestParseException(400, "Bad Request")
-            base_version_number = version.split('/', 1)[1]
-            version_number = base_version_number.split(".")
-            if len(version_number) != 2:
-                raise RequestParseException(400, "Bad Request")
-            version_number = int(version_number[0]), int(version_number[1])
-            # 版本大于等于HTTP/1.1时，支持持续链接
-            if version_number >= (1, 1):
-                self.close_connection = False
-            # 目前不支持http/2的版本
-            if version_number >= (2, 0):
-                raise RequestParseException(400, "Bad Request")
-            self.request.version = version.strip()
         else:
             raise RequestParseException(400, "Bad Request")
+        # 检查客户端的HTTP版本
+        if version[0:5] != "HTTP/":
+            raise RequestParseException(400, "Bad Request")
+        base_version_number = version.split('/', 1)[1]
+        version_number = base_version_number.split(".")
+        if len(version_number) != 2:
+            raise RequestParseException(400, "Bad Request")
+        version_number = int(version_number[0]), int(version_number[1])
+        # 版本大于等于HTTP/1.1时，支持持续链接
+        if version_number >= (1, 1):
+            self.close_connection = False
+        # 目前不支持http/2的版本
+        if version_number >= (2, 0):
+            raise RequestParseException(400, "Bad Request")
+        self.request.version = version.strip()
         self.request.method = method.lower()
+        self.request.version_number = version_number
         self.request.path = path
 
     async def parse_header(self):
@@ -1312,7 +1433,10 @@ class BaseRequestHandler:
     def __init__(self, session:Session, request:Request):
         self.session = session
         self.request = request
-        self.response = None
+        self.response = self.setup_response()
+
+    def setup_response(self):
+        raise NotImplementedError
 
     def write(self, body:str):
         self.response.write(body)
@@ -1334,8 +1458,10 @@ class BaseRequestHandler:
 class RequestHandler(BaseRequestHandler):
     def __init__(self, session:Session, request:Request):
         super().__init__(session, request)
-        self.response = Response()
         self.ui = {}
+
+    def setup_response(self):
+        return Response()
 
     def redirect(self, url, code=None):
         """
@@ -1363,101 +1489,65 @@ class RequestHandler(BaseRequestHandler):
         self.write(t.generate(**kwargs))
 
 
-class StaticFileHandler(BaseRequestHandler):
+class StaticFileHandler(RequestHandler):
     # 下载静态文件
 
     def __init__(self, session:Session, request:Request):
         super().__init__(session, request)
-        self.response = FileResponse()
+
+    def setup_response(self):
+        return FileResponse()
+
+    def request_info(self, include_body):
+        file_path = self.get_file_path()
+        if not file_path:
+            self.write_error(404, "", "{0} FILE NOT FOUND".format(file_path))
+            return False
+        # 尝试读取文件的类型
+        mine_type = Utils.get_file_mime_type(file_path)
+        # 特殊处理head请求，只返回头，不发body数据
+        if not include_body:
+            self.response.only_header()
+        # 客户端想通过range读取数据
+        request_range = self.request.get_header("Range")
+        if request_range and Application.ins().range_support:
+            self.response.set_file(file_path, mine_type)
+            self.response.enable_range(request_range)
+            return
+        # 如果服务器开启了缓存模式
+        if Application.ins().static_cache:
+            # 检查客户端是否带有缓存请求
+            if_modify_date = self.request.get_header("If-Modified-Since")
+            cache_control = self.request.get_header("Cache-Control")
+            file_modify_date = Utils.file_modify_date(file_path)
+            # 如果客户端明确说不使用缓存，那么不走缓存
+            if cache_control and cache_control.find("no-store") >= 0:
+                self.response.set_file(file_path, mine_type)
+                return
+            # 服务器建议客户端走缓存
+            self.response.set_header("Cache-Control", "max-age=3600")
+            self.response.set_header("Last-Modified", file_modify_date)
+            # 如果客户端确实有带有文件修改时间，那就检查缓存
+            if if_modify_date and if_modify_date == file_modify_date:
+                self.response.set_status(304)
+                return
+        # 如果HTTP/1.1 那么可以让客户端请求使用range模式
+        if self.request.version_number >= (1, 1) and Application.ins().range_support:
+            self.response.set_header("Accept-Ranges", "bytes")
+        # 设置文件路径
+        self.response.set_file(file_path, mine_type)
 
     def head(self):
         """
         head 请求
-        :return:
         """
-        return self.get(include_body=False)
+        self.request_info(False)
 
-    def do_cache_request(self, file_path, size, use_range=None):
-        """
-        执行缓存请求
-        :param file_path:
-        :param size:
-        :param use_range:
-        :return:
-        """
-        support_static_cache = Application.ins().static_cache
-        support_chunk = Application.ins().chunk_support
-        max_buff_size = Application.ins().max_buff_size
-        if support_static_cache:
-            if_modify_date = self.request.get_header("If-Modified-Since")
-            cache_control = self.request.get_header("Cache-Control")
-            if not cache_control or cache_control.find("no-cache") < 0:
-                file_modify_date = self.file_modify_date(file_path)
-                if if_modify_date and if_modify_date == file_modify_date and not use_range:
-                    self.response.set_status(304)
-                    return
-                self.response.set_header("Cache-control", "no-cache")
-                if not use_range:
-                    self.response.set_header("Last-Modified", file_modify_date)
-        if not support_static_cache or not use_range:
-            if not support_chunk:
-                self.response.set_header("Content-Length", size)
-            else:
-                self.response.set_header("Transfer-Encoding", "chunked")
-            self.response.using_chunk = support_chunk
-        else:
-            start, end = use_range
-            # Range: -1024表示从资源末尾往前读取1024个字节的内容
-            if start is None:
-                start = size - end
-            # Range: 0- 表示从资源开始到末尾，为了防止资源过大，这里并不一定需要一次性将全部读取返回
-            if end is None:
-                end = size - 1
-            read_size = end - start + 1
-            if read_size > max_buff_size:
-                read_size = max_buff_size
-                end = read_size + start - 1
-            self.response.set_header("Content-Range", "bytes %s-%s/%s" % (start, end, size))
-            self.response.set_header("Content-Length", read_size)
-            self.response.set_status(206)
-            self.response.using_range = True
-            self.response.range = [start, read_size]
-
-    def get(self, include_body=True):
+    def get(self):
         """
         静态文件get请求
-        :param include_body:
-        :return:
         """
-        file_path = self.get_file_path()
-        if not file_path:
-            return self.write_error(404, "", "%s is not exist" % file_path)
-        # 如果不是允许下载的格式，则返回403
-        minetype = self.get_file_mime_type(file_path)
-        if not minetype:
-            return self.write_error(403)
-        if include_body:
-            self.response.file_path = file_path
-        # 获取文件的总大小
-        size = os.path.getsize(file_path)
-        # 设置响应头，表示服务器支持Range格式请求
-        if Application.ins().static_cache:
-            self.response.set_header("Accept-Ranges", "bytes")
-        self.response.set_header("Content-Type", minetype)
-        # 检查客户端的请求中是否采样Range格式请求
-        range_header = self.request.get_header("Range")
-        if not range_header:
-            self.do_cache_request(file_path, size)
-        else:
-            start, end = self.parse_range(range_header)
-            # 需要读取的起始位置不能为空，或者超出了文件的大小
-            if (start is None and end is None) or \
-                    (start is not None and start >= size) or \
-                    (end is not None and end >= size):
-                self.response.set_header("Content-Range", "bytes */%s" % (size,))
-                self.write_error(416)
-                return
-            self.do_cache_request(file_path, size, use_range=[start, end])
+        self.request_info(True)
 
     def get_file_path(self):
         """
@@ -1473,48 +1563,6 @@ class StaticFileHandler(BaseRequestHandler):
         if not os.path.isfile(file_path) or not os.path.exists(file_path):
             return None
         return file_path
-
-    @staticmethod
-    def file_modify_date(file_path):
-        """
-        获取文件的最后修改时间
-        :param file_path:
-        :return:
-        """
-        file_mt = time.localtime(os.stat(file_path).st_mtime)
-        return Utils.to_rfc822(file_mt)
-
-    @staticmethod
-    def parse_range(range_header):
-        """
-        解析请求头中的Range
-        :param range_header:
-        :return: 开始和结束位置，异常则返回空
-        """
-        unit, _, value = range_header.partition("=")
-        unit, value = unit.strip(), value.strip()
-        if unit != "bytes":
-            return None
-        start_b, _, end_b = value.partition("-")
-        start = Utils.int_or_none(start_b)
-        end = Utils.int_or_none(end_b)
-
-        if end is not None:
-            if start is None:
-                if end != 0:
-                    start = -end
-                    end = None
-            else:
-                end += 1
-        return start, end
-
-    @staticmethod
-    def get_file_mime_type(filename):
-        """ 根据文件扩展名获取文件类型 """
-        dot_index = filename.rfind(".")
-        if dot_index < 0:
-            return "application/octet-stream"
-        return MINE_TYPE_DEFINED.get(filename[dot_index:], "application/octet-stream")
 
 
 class ThreadLoopPool:
@@ -1666,6 +1714,10 @@ class Application:
         return self.config.support_chunk
 
     @property
+    def range_support(self):
+        return self.config.support_range
+
+    @property
     def static_path(self):
         return self.config.static_path
 
@@ -1688,6 +1740,9 @@ class Application:
     @property
     def max_thread(self):
         return self.config.max_thread
+
+    def get_runtime_argument(self, name):
+        return self.config.runtime_global_params.get(name, None)
 
     def add_route(self, path, handler_cls):
         if not issubclass(handler_cls, BaseRequestHandler):
@@ -1746,6 +1801,17 @@ class Application:
         name = handle.__name__
         self.system_stop_handlers[name] = handle
 
+    def reload(self):
+        root = os.path.normpath(os.path.abspath(self.config.script_path))
+        all_modules = list(sys.modules.values())
+        for m in all_modules:
+            if not hasattr(m, "__file__") or not m.__file__:
+                continue
+            filename = os.path.normpath(os.path.abspath(m.__file__))
+            if filename.startswith(root):
+                importlib.reload(m)
+        self.load_all_scripts()
+
 
 def route(path):
     # 装饰器 绑定路由
@@ -1761,8 +1827,11 @@ def start_server(config:HttpConfig, host="127.0.0.1", port=8080):
 
 
 def reload():
-    Application.ins().load_all_scripts()
+    Application.ins().reload()
 
+
+def get_argument(name):
+    return Application.ins().get_runtime_argument(name)
 
 def on_start():
     # 程序启动时的回调注册
