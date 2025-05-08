@@ -1,0 +1,2 @@
+include hibou.cp37-win_amd64.pyd
+include hibou.pyi

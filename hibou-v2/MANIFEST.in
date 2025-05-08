@@ -1,0 +1,2 @@
+include hibou_web/*.pyd
+include hibou_web/*.pyi
