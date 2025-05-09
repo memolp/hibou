@@ -861,7 +861,6 @@ class HttpConfig:
         self.logger_level = logging.INFO   # 日志等级
         self.namespace = {}
         self.static_path = None
-        self.upload_path = None
         self.script_path = None
         self.template_path = None
         self.support_static_cache = True
@@ -882,9 +881,6 @@ class HttpConfig:
 
     def static_path_root(self, path):
         self.static_path = path
-
-    def upload_path_root(self, path):
-        self.upload_path = path
 
     def script_path_root(self, path):
         self.script_path = path
@@ -1809,10 +1805,6 @@ class Application:
     @property
     def static_path(self):
         return self.config.static_path
-
-    @property
-    def upload_path(self):
-        return self.config.upload_path
 
     @property
     def template_path(self):

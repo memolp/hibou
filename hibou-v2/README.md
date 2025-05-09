@@ -12,7 +12,6 @@ from hibou_web import hibou
 
 conf = hibou.HttpConfig()
 conf.static_path_root("static")   # 设置静态资源的路径
-conf.upload_path_root("static/upload files")  # 设置上传文件的保存路径
 conf.script_path_root("scripts")  # 设置脚本的目录
 conf.template_path_root("templates")    # 设置HTML模板文件的目录
 hibou.start_server(conf, "0.0.0.0", 7000)  # 启动HTTP服务
