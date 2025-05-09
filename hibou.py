@@ -133,7 +133,7 @@ class Utils:
             else:
                 return str(data)
         except Exception as e:
-            print(e)
+            logging.exception("to_utf8 error:%s data:%s", e, data)
         return data
 
     @staticmethod
@@ -194,6 +194,18 @@ class Buffer:
         self.file_buffer = None
         self.buffer_readable = False
         self.buffer_writeable = True
+
+    def tell(self):
+        if self.file_buffer:
+            return self.file_buffer.tell()
+        else:
+            return self.buffer.tell()
+
+    def seek(self, offset, where):
+        if self.file_buffer:
+            self.file_buffer.seek(offset, where)
+        else:
+            self.buffer.seek(offset, where)
 
     def size(self):
         if self.file_buffer:
@@ -328,7 +340,6 @@ class Template(object):
         namespace.update(kwargs)
         Utils.exec_code(self.compiled, namespace)
         execute = namespace["_tt_execute"]
-        # print execute,type(execute)
         return execute()
 
     def _compile_code(self, name, template_string, compress_whitespace):
@@ -697,17 +708,151 @@ class _TemplateReader(object):
                 raise ParseError("unknown operator: %r" % operator)
 
 
-# 保存上传的文件类
-class UploadFile:
-    def __init__(self, filename, filetype, filedata):
+class Field:
+    def __init__(self, name, value):
+        self.name = name
+        self.value = value
+
+    def __str__(self):
+        return "name={0}, value={1}".format(self.name, self.value)
+
+class FileField:
+    def __init__(self, name, filename, filetype, buffer, size:int):
+        self.name = name
         self.filename = filename
         self.filetype = filetype
-        self.filedata = filedata
+        self._buffer = buffer   #type: io.FileIO or io.BytesIO
+        self.size = size
+
+    def __str__(self):
+        return "name={0}, filename={1}, type={2}, size={3}".format(self.name, self.filename, self.filetype, self.size)
 
     def save(self, path):
         with open(path, 'wb') as f:
-            f.write(self.filedata)
-        return path
+            content_length = self.size
+            while content_length > 0:
+                chunk = self._buffer.read(content_length)
+                if not chunk:
+                    break
+                f.write(chunk)
+                content_length -= len(chunk)
+
+    def read(self, size):
+        assert size <= self.size, "读取超过"
+        return self._buffer.read(size)
+
+
+class MultipartParser:
+    def __init__(self, buffer:Buffer, boundary:bytes):
+        self.buffer = buffer
+        self.boundary = b"--" + boundary
+        self.end_boundary = self.boundary + b'--'
+        self.leftover = b""
+        self.buffer_size = 8192
+        self.HTTP_LRE = "\r\n"
+
+    def read_boundary(self):
+        size = len(self.boundary) * 2   # 读取
+        buf = b""
+        while True:
+            chunk = self.buffer.read(size)
+            if not chunk:
+                break
+            buf += chunk
+            boundary_idx = buf.find(self.boundary)
+            if boundary_idx == -1:  # 说明没找到
+                buf = chunk     # 将buf指向当前的chunk部分，与下一个chunk拼接后查找
+                continue
+            # 假设boundary长度为5， 那么读取10字节后，位置在900， 那么开始的位置是890
+            # 真正的数据范围是890 + boundary_idx的位置。
+            end_pos = self.buffer.tell() - len(buf) + boundary_idx
+            # 将buffer的读取位置指向刚好跳过分割位置
+            return end_pos
+        return -1
+
+    @staticmethod
+    def parse_multipart_form_head(data: str):
+        # form-data的头内容解析
+        # Content-Disposition: form-data; name="name of pdf"; filename="pdf-file.pdf"
+        # Content-Type: application/octet-stream
+        headers = {}
+        for i, item in enumerate(data.split(";")):
+            if i == 0:
+                kv = item.split(":")
+            else:
+                kv = item.split("=")
+            if len(kv) == 2:
+                headers[kv[0].strip().lower()] = kv[1].strip()
+        return headers
+
+    def read_headers(self):
+        form_headers = {}  # 读取multipart/form-data的头
+        while True:
+            line = self.buffer.readline()
+            if line.startswith(b"\r\n"):  # 读取结束
+                break
+            headers = self.parse_multipart_form_head(line.decode("utf-8"))
+            form_headers.update(headers)
+        return form_headers
+
+    def read_data(self, content_length):
+        buffer = io.BytesIO()
+        while content_length > 0:
+            chunk = self.buffer.read(content_length)
+            if not chunk:
+                break
+            buffer.write(chunk)
+            content_length -= len(chunk)
+        return buffer
+
+    def parse(self):
+        # 跳过第一个boundary
+        fields = []
+        while True:
+            field = self.parse_field()
+            if not field:
+                break
+            fields.append(field)
+        return fields
+
+    def parse_field(self):
+        line = self.buffer.readline()
+        if not line or not line.startswith(self.boundary):
+            return
+        # 结束标记
+        if line.startswith(self.end_boundary):
+            return
+        headers = self.read_headers()
+        start_pos = self.buffer.tell()      # 上面已经读取完头，那么这里的起始位置就是body的开始
+        end_pos = self.read_boundary()      # 下一个body的开始位置，就是整个body的内容
+        if end_pos == -1:
+            return
+        disposition = headers.get("content-disposition", "")
+        name = headers.get("name", "")
+        if not disposition or not name or not disposition.startswith("form-data"):
+            raise RequestParseException(400, "Bad Request")
+        # 只有文件才会有这个字段
+        filename = headers.get("filename", "")
+        if not filename:
+            # 不是文件，则直接读取出里面的内容
+            self.buffer.seek(start_pos, io.SEEK_SET)
+            value = self.read_data(end_pos - start_pos).getvalue()
+            self.buffer.seek(end_pos, io.SEEK_SET)
+            return Field(name, value.decode("utf-8").strip(self.HTTP_LRE))
+        # 文件数据
+        content_type = headers.get("content-type", "")
+        size = end_pos - start_pos - 2  # 去掉最后的\r\n
+        # 如果文件很小，没有落地，那么直接从内存读取
+        if not self.buffer.file_buffer:
+            self.buffer.seek(start_pos, io.SEEK_SET)
+            value = self.read_data(size)
+            self.buffer.seek(end_pos, io.SEEK_SET)
+            return FileField(name, filename, content_type, value, size)
+
+        self.buffer.seek(end_pos, io.SEEK_SET)
+        value = io.FileIO(self.buffer.filename, "rb")
+        value.seek(start_pos, io.SEEK_SET)
+        return FileField(name, filename, content_type, value, size)
 
 
 class HttpConfig:
@@ -952,6 +1097,17 @@ class Request:
         self.arguments = {}
         self.files = {}
 
+    def clear(self):
+        if self.files:
+            self.files.clear()
+        # 当客户端上传大文件的时候会触发临时落地数据，因此在请求结束后需要清楚掉这个缓存数据
+        if not self.body or not isinstance(self.body, Buffer):
+            return
+        # 清理请求的数据
+        if self.body.file_buffer:
+            self.body.file_buffer.close()
+            os.remove(self.body.filename)
+
     def get_header(self, name):
         return self.headers.get(name.lower(), None)
 
@@ -1077,6 +1233,11 @@ class SessionHandler:
             self.close_connection = True
         except RequestParseException as e:
             await self.do_default_response(e.code, e.msg)
+
+        try:
+            self.request.clear()
+        except Exception as e:
+            logging.exception("request clear error:%s", e)
 
     async def do_method(self):
         route_path = self.request.path
@@ -1321,18 +1482,6 @@ class SessionHandler:
             args = urllib.parse.parse_qs(buffer.get_value().decode(), keep_blank_values=True)
             self.request.arguments.update(args)
 
-    def parse_sub_header(self, headers):
-        """
-        解析请求头数据
-        :param headers:
-        :return:
-        """
-        headers_re = {}
-        for line in self.HTTP_LRE.split(headers):
-            key, args = line.split(":")
-            headers_re[key] = args
-        return headers_re
-
     def parse_multipart_form_data(self, buffer:Buffer, boundary):
         # # 请求头 - 这个是必须的，需要指定Content-Type为multipart/form-data，指定唯一边界值
         # Content-Type: multipart/form-data; boundary=${Boundary}
@@ -1357,76 +1506,16 @@ class SessionHandler:
         boundary = boundary.encode("utf-8")
         if boundary.startswith(b'"') and boundary.endswith(b'"'):
             boundary = boundary[1:-1]
-
-        split_boundary = b"--" + boundary           # 读取multipart/form-data的开始边界
-        final_boundary = b"--" + boundary + b"--"        # 读取multipart/form-data的结束边界
-        while True:
-            line = buffer.readline()
-            if not line or not line.startswith(split_boundary):
-                continue
-            # 返回False表示已经读取到最后一项数据了
-            if not self.parse_single_multipart_form_data(buffer, split_boundary, final_boundary):
-                break
-
-    @staticmethod
-    def parse_multipart_form_head(data:str):
-        # form-data的头内容解析
-        # Content-Disposition: form-data; name="name of pdf"; filename="pdf-file.pdf"
-        # Content-Type: application/octet-stream
-        headers = {}
-        for i, item in enumerate(data.split(";")):
-            if i == 0:
-                kv = item.split(":")
-            else:
-                kv = item.split("=")
-            if len(kv) == 2:
-                headers[kv[0].strip().lower()] = kv[1].strip()
-        return headers
-
-    @staticmethod
-    def read_multipart_form_value(buffer:Buffer, value, boundary:bytes):
-        # 读取multipart/form-data的值
-        while True:
-            line = buffer.readline()
-            if line.startswith(boundary):
-                return line
-            value.write(line)
-
-    def parse_single_multipart_form_data(self, buffer:Buffer, split_boundary:bytes, final_boundary:bytes):
-        # 读取multipart/form-data中单项数据内容
-
-        form_headers = {}   # 读取multipart/form-data的头
-        while True:
-            line = buffer.readline().decode("utf-8")
-            if line.startswith(self.HTTP_LRE):  # 读取结束
-                break
-            headers = self.parse_multipart_form_head(line)
-            form_headers.update(headers)
-
-        # Content-Disposition: form-data; name="${PART_NAME}"; 必须包含，用于指定接下来的请求体的名称
-        disposition = form_headers.get("content-disposition", "")
-        name = form_headers.get("name", "")
-        if not disposition or not name or not disposition.startswith("form-data"):
-            raise RequestParseException(400, "Bad Request")
-        # 只有文件才会有这个字段
-        filename = form_headers.get("filename", "")
-        if not filename:
-            # 不是文件，则直接读取出里面的内容
-            value = io.BytesIO()
-            line = self.read_multipart_form_value(buffer, value, split_boundary)
-            self.request.arguments.setdefault(name, []).append(value.getvalue().decode("utf-8"))
-            if line.startswith(final_boundary): # 结束
-                return False
-            return True
-        # 是文件，则需要保存到临时文件中
-        temp_file_path = os.path.join(Application.ins().upload_path, filename)
-        value = Buffer(temp_file_path)
-        line = self.read_multipart_form_value(buffer, value, split_boundary)
-        #.setdefault(name, []).append(http_file) 暂时去掉同name的支持
-        self.request.files.setdefault(name, []).append(UploadFile(filename, form_headers.get("content-type"), value))
-        if line.startswith(final_boundary): # 结束
-            return False
-        return True
+        # multipart/form-data流式解析类，解决上传大文件用内存处理会崩的问题。
+        # 客户端上传的大文件时，服务器会有一个临时的缓存文件接受内容，通过self.request.files里面的FileField对象进行存储到指定的地方
+        # 如果没有调用存储，那么本次响应结束后，缓存数据会删除
+        multipart_parser = MultipartParser(buffer, boundary)
+        parts = multipart_parser.parse()
+        for field in parts:
+            if isinstance(field, Field):
+                self.request.arguments.setdefault(field.name, []).append(field.value)
+            elif isinstance(field, FileField):
+                self.request.files.setdefault(field.name, []).append(field)
 
 
 class BaseRequestHandler:
