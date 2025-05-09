@@ -2,7 +2,7 @@
 一个简单的Python语言写的Http服务器，学习了其他的框架的，然后尝试自己实现的一个框架，可以理解他是一个玩具，代码简单方便快速使用。
 我主要用它可以搭建一些团队内部使用的平台工具。<br>
 里面使用了协程+多线程的方式处理请求，支持模板渲染页面，支持GET和POST请求，<br>
-写了`multipart/form-data`的支持逻辑，但是没有测试！！！
+POST方法支持`application/x-www-form-urlencoded`和`multipart/form-data`的表单提交，支持上传大型文件，使用流式解析处理。
 
 
 # 如何使用
