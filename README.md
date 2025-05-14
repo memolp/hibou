@@ -73,8 +73,8 @@ class IndexHandler(hibou.RequestHandler):
 这种需要进行模板渲染的，我没有优化模板渲染，每次调用render都是重新读取文件处理，没有使用缓存。
 每秒可以处理1000的请求，已经满足我平常使用了。
 ```commandline
-./wrk -c 100 -t 2 -d 60 http://172.25.22.37:7000/
-Running 1m test @ http://172.25.22.37:7000/
+./wrk -c 100 -t 2 -d 60 http://127.0.0.1/
+Running 1m test @ http://127.0.0.1/
   2 threads and 100 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
     Latency    94.88ms    6.92ms 152.02ms   88.34%
