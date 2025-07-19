@@ -909,6 +909,7 @@ class Response:
         self.cookies = {}
         self.body = io.BytesIO()
         self.version = "HTTP/1.1"
+        self.keep_alive = True
 
     def set_status(self, code, msg=""):
         self.status_code = code
@@ -1257,7 +1258,8 @@ class SessionHandler:
         if not isinstance(response, Response):
             raise RequestParseException(500, "Server Error")
         try:
-            if self.close_connection:
+            if self.close_connection or (not response.keep_alive):  # 如果设置不保持链接，则也关闭
+                self.close_connection = True
                 response.set_header("Connection", "close")
             else:
                 response.set_header("Connection", "keep-alive")
@@ -1576,7 +1578,6 @@ class RequestHandler(BaseRequestHandler):
 
 class StaticFileHandler(RequestHandler):
     # 下载静态文件
-
     def __init__(self, session:Session, request:Request):
         super().__init__(session, request)
 
