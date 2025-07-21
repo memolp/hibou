@@ -866,7 +866,7 @@ class HttpConfig:
         self.support_static_cache = True
         self.support_chunk = False
         self.support_range = True
-        self.max_buff_size = 1024 * 1024 * 10
+        self.max_buff_size = 1024 * 1024 * 1
         self.backlog = 1024
         self.max_thread = 2
         self.runtime_global_params = {}
@@ -1050,6 +1050,7 @@ class FileResponse(Response):
                     self._send_chunk(session, b"")
                     break
                 self._send_chunk(session, chunk)
+                time.sleep(0.1)
 
     @staticmethod
     def _send_chunk(session, chunk:bytes):
@@ -1080,6 +1081,7 @@ class FileResponse(Response):
                 if not data:
                     break
                 session.write_raw(data)
+                time.sleep(0.1)
 
 
 class Request:
