@@ -144,28 +144,48 @@ class Utils:
         return data
 
     @staticmethod
-    def read_range(range_header:str):
+    def read_range(range_header:str, file_size:int):
         """
         解析请求头中的Range
         :param range_header:
         :return: 开始和结束位置，异常则返回空
         """
-        unit, _, value = range_header.partition("=")
-        unit, value = unit.strip(), value.strip()
-        if unit != "bytes":
+        end_index = file_size - 1
+        bytes_ = "bytes="
+        if not range_header.startswith(bytes_):
             return None
-        start_b, _, end_b = value.partition("-")
-        start = Utils.int_or_none(start_b)
-        end = Utils.int_or_none(end_b)
-
-        if end is not None:
-            if start is None:
-                if end != 0:
-                    start = -end
-                    end = None
+        # 由于range支持多个请求，这里也支持一下
+        ranges = []
+        for range_ in range_header[len(bytes_): ]. split(","):
+            start_b, split_tag, end_b = range_.partition("-")   #
+            if split_tag != '-':    # 格式错误
+                return None
+            if not start_b and not end_b:   # 格式错误
+                return None
+            start = Utils.int_or_none(start_b)
+            end = Utils.int_or_none(end_b)
+            if start is None:       # -xxx 最后xxx字节
+                start = end_index - end + 1
+                end = end_index
             else:
-                end += 1
-        return start, end
+                if end is None:     # xxx-  从xxx开始到末尾
+                    end = end_index
+                if start > end:     # 格式错误
+                    return None
+                end = min(end, end_index)
+            ranges.append((start, end))
+
+        merged = []     # 合并
+        ranges = sorted(ranges, key=lambda x: x[0])     # 已起始点进行排序
+        for range_ in ranges:
+            if not merged:
+                merged.append(range_)
+            else:
+                if range_[0] <= merged[-1][1] + 1:
+                    merged[-1]= (merged[-1][0], max(range_[1], merged[-1][1]))
+                else:
+                    merged.append(range_)
+        return merged
 
     @staticmethod
     def file_modify_date(file_path):
@@ -993,30 +1013,16 @@ class FileResponse(Response):
     def enable_range(self, request_range:str):
         if not Application.ins().range_support:
             return
-        max_buff_size = Application.ins().max_buff_size
-        start, end = Utils.read_range(request_range)
-        if start is None and end is None:
+        if not self._file_path:
+            raise ValueError("请先调用set_file之后调用enable_range!!!")
+        ranges = Utils.read_range(request_range, self._file_size)
+        if not ranges or len(ranges) > 1:   # 先不支持multipart range请求
             self.set_header("Content-Range", "bytes */%s" % (self._file_size,))
             self.set_status(416)
             return
-        if start is not None and start >= self._file_size:
-            self.set_header("Content-Range", "bytes */%s" % (self._file_size,))
-            self.set_status(416)
-            return
-        if end is not None and end >= self._file_size:
-            self.set_header("Content-Range", "bytes */%s" % (self._file_size,))
-            self.set_status(416)
-            return
-        # Range: -1024表示从资源末尾往前读取1024个字节的内容
-        if start is None and end is not None:
-            start = self._file_size - end
-        # Range: 0- 表示从资源开始到末尾，为了防止资源过大，这里并不一定需要一次性将全部读取返回
-        if end is None:
-            end = self._file_size - 1
-        read_size = end - start + 1
-        if read_size > max_buff_size:
-            read_size = max_buff_size
-            end = read_size + start - 1
+        # 只发第一个区域
+        start, end = ranges[0]
+        read_size = end - start + 1     # 读取长度
         self.set_header("Content-Range", "bytes %s-%s/%s" % (start, end, self._file_size))
         self.set_header("Content-Length", read_size)
         self.set_status(206)
@@ -1062,11 +1068,15 @@ class FileResponse(Response):
 
     async def write_with_range(self, session):
         start_pos = self._range[0]
-        size = self._range[1]
+        size = self._range[1] - start_pos + 1
+        max_buff_size = Application.ins().max_buff_size
         with open(self._file_path, "rb") as fp:
             fp.seek(start_pos, io.SEEK_SET)
-            chunk = fp.read(size)
-            session.write_raw(chunk)
+            while size > 0:
+                chunk = fp.read(min(size, max_buff_size))
+                size -= len(chunk)
+                session.write_raw(chunk)
+                await asyncio.sleep(0.1)
 
     async def send_body(self, session):
         if not self._file_path:
@@ -1173,7 +1183,7 @@ class Session:
 
     def write(self, text:str):
         if self.closed:
-            return
+            raise RequestCloseException()
         try:
             self.write_fd.write(text.encode("utf-8"))
             self.write_fd.flush()
@@ -1183,7 +1193,7 @@ class Session:
 
     def write_raw(self, raw:bytes):
         if self.closed:
-            return
+            raise RequestCloseException()
         try:
             self.write_fd.write(raw)
             self.write_fd.flush()
@@ -1193,8 +1203,11 @@ class Session:
 
     def finish(self):
         if self.closed:
-            return
-        self.write_fd.flush()
+            raise RequestCloseException()
+        try:
+            self.write_fd.flush()
+        except Exception as e:
+            raise RequestCloseException()
 
     def close(self):
         try:
@@ -1270,6 +1283,8 @@ class SessionHandler:
             await response.send_header(self.session)
             await response.send_body(self.session)
             self.session.finish()
+        except RequestCloseException as e:
+            self.close_connection = True
         except socket.error as e:
             logging.exception("do_response session:%s error:%s", self.session.session_id, e.errno)
         except Exception as e:
@@ -1351,7 +1366,7 @@ class SessionHandler:
         self.request.version = version.strip()
         self.request.method = method.lower()
         self.request.version_number = version_number
-        self.request.path = path
+        self.request.path = urllib.parse.unquote(path)
 
     async def parse_header(self):
         # 解析请求头Request Headers）：
