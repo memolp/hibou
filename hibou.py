@@ -851,6 +851,7 @@ class MultipartParser:
         name = headers.get("name", "")
         if not disposition or not name or not disposition.startswith("form-data"):
             raise RequestParseException(400, "Bad Request")
+        name = name.strip("'").strip('"')
         # 只有文件才会有这个字段
         filename = headers.get("filename", "")
         if not filename:
@@ -860,6 +861,7 @@ class MultipartParser:
             self.buffer.seek(end_pos, io.SEEK_SET)
             return Field(name, value.decode("utf-8").strip(self.HTTP_LRE))
         # 文件数据
+        filename = filename.strip("'").strip('"')
         content_type = headers.get("content-type", "")
         size = end_pos - start_pos - 2  # 去掉最后的\r\n
         # 如果文件很小，没有落地，那么直接从内存读取
@@ -867,6 +869,7 @@ class MultipartParser:
             self.buffer.seek(start_pos, io.SEEK_SET)
             value = self.read_data(size)
             self.buffer.seek(end_pos, io.SEEK_SET)
+            value.seek(0, io.SEEK_SET)
             return FileField(name, filename, content_type, value, size)
 
         self.buffer.seek(end_pos, io.SEEK_SET)
@@ -1106,7 +1109,7 @@ class Request:
         self.version_number = (1, 1)
         self.cookies = {}
         self.arguments = {}
-        self.files = {}
+        self.files = {}     # type: dict[str, list[FileField]]
 
     def clear(self):
         if self.files:
