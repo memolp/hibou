@@ -892,12 +892,19 @@ class HttpConfig:
         self.max_buff_size = 1024 * 1024 * 2
         self.backlog = 1024
         self.max_thread = 2
+        self.is_https = False
+        self.ssl_cert = None
         self.runtime_global_params = {}
 
     def bind_runtime(self, name, runtime):
         if not isinstance(runtime, Runtime):
             raise ValueError("runtime must be an instance of AntRuntime")
         self.namespace[name] = runtime
+
+    def using_https(self, key_file, cert_file):
+        # 使用https
+        self.is_https = True
+        self.ssl_cert = (key_file, cert_file)
 
     def bind_param(self, name, symbol):
         self.runtime_global_params[name] = symbol
@@ -1721,9 +1728,14 @@ class HttpServer:
     def create_server_socket(self):
         # 启动HTTP服务器
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # 增加对https的支持
+        if Application.ins().is_https:
+            key_file, cert_file = Application.ins().ssl_cert
+            self.server_socket = ssl.wrap_socket(self.server_socket, keyfile=key_file, certfile=cert_file, server_side=True)
         self.server_socket.bind((self.host, self.port))
         self.server_socket.listen(Application.ins().backlog)
         self.selector.register(self.server_socket, selectors.EVENT_READ, self.accept)
+
         logging.debug(f"Server started at {self.host}:{self.port}")
 
     def start(self):
@@ -1844,6 +1856,14 @@ class Application:
     @property
     def max_thread(self):
         return self.config.max_thread
+
+    @property
+    def is_https(self):
+        return self.config.is_https
+
+    @property
+    def ssl_cert(self):
+        return self.config.ssl_cert
 
     def get_runtime_argument(self, name):
         return self.config.runtime_global_params.get(name, None)

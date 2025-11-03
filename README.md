@@ -84,3 +84,25 @@ Running 1m test @ http://127.0.0.1/
 Requests/sec:   1043.35
 Transfer/sec:    487.03KB
 ```
+
+### 使用HTTPS
+想要使用HTTPS，只需要在配置中使用`using_https`即可。
+```python
+import hibou    # 导入模块
+conf = hibou.HttpConfig()
+conf.static_path_root("static")   # 设置静态资源的路径
+conf.script_path_root("scripts")  # 设置脚本的目录
+conf.template_path_root("templates")    # 设置HTML模板文件的目录
+# 这里就是设置https的证书，然后
+conf.using_https("server.key", "server.crt")
+hibou.start_server(conf, "0.0.0.0", 7000)  # 启动HTTP服务
+```
+关于本地证书：需要安装openssl（注意其中Common Name 一定要设置为对应的IP或者域名
+```shell
+# 生成私钥
+openssl genrsa -out server.key 2048
+# 生成证书签名请求 (CSR)
+openssl req -new -key server.key -out server.csr
+# 生成自签名证书（有效期 1095 天）
+openssl x509 -req -days 1095 -in server.csr -signkey server.key -out server.crt
+```
