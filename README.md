@@ -105,4 +105,6 @@ openssl genrsa -out server.key 2048
 openssl req -new -key server.key -out server.csr
 # 生成自签名证书（有效期 1095 天）
 openssl x509 -req -days 1095 -in server.csr -signkey server.key -out server.crt
+# 或者采用下面的指令，可以一次性全部生成：
+openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt -days 365 -nodes
 ```
