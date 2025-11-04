@@ -1335,7 +1335,7 @@ class SessionHandler:
                 return
             # 客户端没有提供keep-alive的也不复用
             keep_alive = self.request.get_header("Connection")
-            if not keep_alive or keep_alive.lower() == "close":
+            if keep_alive and keep_alive.lower() == "close":
                 self.close_connection = True
                 return
 
@@ -1549,7 +1549,7 @@ class BaseRequestHandler:
     def __init__(self, session:Session, request:Request):
         self.session = session
         self.request = request
-        self.response = self.setup_response()
+        self.response = self.setup_response()   # type: Response
 
     def setup_response(self):
         raise NotImplementedError
@@ -1728,10 +1728,6 @@ class HttpServer:
     def create_server_socket(self):
         # 启动HTTP服务器
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # 增加对https的支持
-        if Application.ins().is_https:
-            key_file, cert_file = Application.ins().ssl_cert
-            self.server_socket = ssl.wrap_socket(self.server_socket, keyfile=key_file, certfile=cert_file, server_side=True)
         self.server_socket.bind((self.host, self.port))
         self.server_socket.listen(Application.ins().backlog)
         self.selector.register(self.server_socket, selectors.EVENT_READ, self.accept)
@@ -1799,12 +1795,17 @@ class HttpSSLServer(HttpServer):
         super().__init__(host, port)
         self.cert_file = cert_file
         self.keyfile = keyfile
+        self.context = ssl.create_default_context(purpose=ssl.Purpose.CLIENT_AUTH)
 
     def create_server_socket(self):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.context.load_cert_chain(self.cert_file, self.keyfile)
+        self.context.check_hostname = False
+        self.context.verify_mode = ssl.CERT_NONE
+        self.server_socket = self.context.wrap_socket(self.server_socket, server_side=True)
         self.server_socket.bind((self.host, self.port))
         self.server_socket.listen(Application.ins().backlog)
-        self.server_socket = ssl.wrap_socket(self.server_socket, certfile=self.cert_file, keyfile=self.keyfile, server_side=True)
+        self.selector.register(self.server_socket, selectors.EVENT_READ, self.accept)
         logging.info(f"SSL Server started at {self.host}:{self.port}")
 
 
@@ -1907,7 +1908,11 @@ class Application:
         logging.debug("do system start call")
         for name, handle in self.system_start_handlers.items():
             handle()
-        server = HttpServer(host, port)
+        if config.is_https:
+            key_file, cert_file = config.ssl_cert
+            server = HttpSSLServer(host, port, cert_file, key_file)
+        else:
+            server = HttpServer(host, port)
         server.start()
         logging.debug("do system stop call")
         for name, handle in self.system_stop_handlers.items():
