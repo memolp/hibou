@@ -1800,13 +1800,43 @@ class HttpSSLServer(HttpServer):
     def create_server_socket(self):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.context.load_cert_chain(self.cert_file, self.keyfile)
+        # TODO 这里在正式环境中应该不进行设置
         self.context.check_hostname = False
         self.context.verify_mode = ssl.CERT_NONE
-        self.server_socket = self.context.wrap_socket(self.server_socket, server_side=True)
+        # do_handshake_on_connect = False 禁止连接时立即握手，采用手动握手
+        self.server_socket = self.context.wrap_socket(self.server_socket, server_side=True, do_handshake_on_connect=False)
         self.server_socket.bind((self.host, self.port))
         self.server_socket.listen(Application.ins().backlog)
         self.selector.register(self.server_socket, selectors.EVENT_READ, self.accept)
         logging.info(f"SSL Server started at {self.host}:{self.port}")
+
+    def do_handshake(self, client_socket:ssl.SSLSocket):
+        """ 执行握手 """
+        try:
+            client_socket.settimeout(1)  # 强制设置超时，防止握手过长导致的BUG - TODO时间需要有线上环境测试
+            client_socket.do_handshake(False)  # 执行握手
+        except ssl.SSLError as e:
+            # TODO 开发版本下的自建证书会有这个报错，可以暂时忽略
+            if e.reason != "SSLV3_ALERT_CERTIFICATE_UNKNOWN":
+                raise Exception(f"client socket do_handshake failed! reason:{e.reason}")
+
+    def accept(self, server_socket):
+        """
+        重写accept，增加手动握手逻辑。
+        原因： 如果客户端连接上来走的不是https而是其他例如http协议的话，
+            1. 通过do_handshake_on_connect=True实现的自动握手会产生阻塞流程，后续的连接都必须等当前http超时
+            2. 即使手动握手也需要设置socket超时时间，防止握手中缓慢影响后续的连接
+        :param server_socket:
+        :return:
+        """
+        try:
+            client_socket, addr = server_socket.accept()
+            logging.debug(f"Connection from {addr}")
+            self.do_handshake(client_socket)
+            client_socket.setblocking(False)
+            self.selector.register(client_socket, selectors.EVENT_READ, self.read)
+        except Exception as e:
+            logging.exception(f"Error accepting connection: {e}")
 
 
 class Application:
