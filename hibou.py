@@ -1223,6 +1223,7 @@ class Session:
 
     def close(self):
         try:
+            self.client_sock.shutdown(socket.SHUT_RDWR)
             self.client_sock.close()
         except socket.error as e:
             logging.error("close session:%s error:%s", self.session_id, e.errno)
