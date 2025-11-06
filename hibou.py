@@ -893,6 +893,7 @@ class HttpConfig:
         self.backlog = 1024
         self.max_thread = 2
         self.is_https = False
+        self.is_debug_https = False
         self.ssl_cert = None
         self.runtime_global_params = {}
 
@@ -901,9 +902,10 @@ class HttpConfig:
             raise ValueError("runtime must be an instance of AntRuntime")
         self.namespace[name] = runtime
 
-    def using_https(self, key_file, cert_file):
-        # 使用https
+    def using_https(self, key_file, cert_file, debug_https=False):
+        # 使用https,  debug_https:表示使用自建的证书
         self.is_https = True
+        self.is_debug_https = debug_https
         self.ssl_cert = (key_file, cert_file)
 
     def bind_param(self, name, symbol):
@@ -1800,9 +1802,12 @@ class HttpSSLServer(HttpServer):
     def create_server_socket(self):
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.context.load_cert_chain(self.cert_file, self.keyfile)
-        # TODO 这里在正式环境中应该不进行设置
-        self.context.check_hostname = False
-        self.context.verify_mode = ssl.CERT_NONE
+        # 这里在正式环境中应该不进行设置
+        if Application.ins().is_debug_https:
+            self.context.check_hostname = False
+            self.context.verify_mode = ssl.CERT_NONE
+        else:
+            self.context.verify_mode = ssl.CERT_REQUIRED
         # do_handshake_on_connect = False 禁止连接时立即握手，采用手动握手
         self.server_socket = self.context.wrap_socket(self.server_socket, server_side=True, do_handshake_on_connect=False)
         self.server_socket.bind((self.host, self.port))
@@ -1816,8 +1821,8 @@ class HttpSSLServer(HttpServer):
             client_socket.settimeout(1)  # 强制设置超时，防止握手过长导致的BUG - TODO时间需要有线上环境测试
             client_socket.do_handshake(False)  # 执行握手
         except ssl.SSLError as e:
-            # TODO 开发版本下的自建证书会有这个报错，可以暂时忽略
-            if e.reason != "SSLV3_ALERT_CERTIFICATE_UNKNOWN":
+            # 开发版本下的自建证书会有这个报错，可以暂时忽略
+            if not Application.ins().is_debug_https or e.reason != "SSLV3_ALERT_CERTIFICATE_UNKNOWN":
                 raise Exception(f"client socket do_handshake failed! reason:{e.reason}")
 
     def accept(self, server_socket):
@@ -1891,6 +1896,10 @@ class Application:
     @property
     def is_https(self):
         return self.config.is_https
+
+    @property
+    def is_debug_https(self):
+        return self.config.is_debug_https
 
     @property
     def ssl_cert(self):
