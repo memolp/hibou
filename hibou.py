@@ -147,7 +147,8 @@ class Utils:
     def read_range(range_header:str, file_size:int):
         """
         解析请求头中的Range
-        :param range_header:
+        :param range_header: http请求中的RANGE内容例如：bytes=-222
+        :param file_size: 当前文件的大小
         :return: 开始和结束位置，异常则返回空
         """
         end_index = file_size - 1
@@ -453,12 +454,7 @@ class _Expression(_Node):
     def generate(self, writer):
         writer.write_line("_tt_tmp = %s" % self.expression, self.line)
         writer.write_line("_tt_tmp = _tt_utf8(_tt_tmp)", self.line)
-        # writer.write_line("if isinstance(_tt_tmp, (str,unicode)):"
-        #                  " _tt_tmp = _tt_utf8(_tt_tmp)", self.line)
-        # writer.write_line("else: _tt_tmp = _tt_utf8(str(_tt_tmp))", self.line)
         if not self.raw and writer.current_template.autoescape is not None:
-            # In python3 functions like xhtml_escape return unicode,
-            # so we have to convert to utf8 again.
             writer.write_line("_tt_tmp = _tt_utf8(%s(_tt_tmp))" %
                               writer.current_template.autoescape, self.line)
         writer.write_line("_tt_append(_tt_tmp)", self.line)
@@ -1218,7 +1214,7 @@ class Session:
             raise RequestCloseException()
         try:
             self.write_fd.flush()
-        except Exception as e:
+        except Exception:
             raise RequestCloseException()
 
     def close(self):
@@ -1296,7 +1292,7 @@ class SessionHandler:
             await response.send_header(self.session)
             await response.send_body(self.session)
             self.session.finish()
-        except RequestCloseException as e:
+        except RequestCloseException:
             self.close_connection = True
         except socket.error as e:
             logging.exception("do_response session:%s error:%s", self.session.session_id, e.errno)
@@ -1555,22 +1551,42 @@ class BaseRequestHandler:
         self.response = self.setup_response()   # type: Response
 
     def setup_response(self):
+        """用于创建响应处理对象"""
         raise NotImplementedError
 
     def write(self, body:str):
+        """
+        响应客户端的内容
+        :param body: 内容
+        """
         self.response.write(body)
 
     def write_error(self, code, msg="", body=""):
+        """
+        响应错误 注意：没有做意外处理，如果需要针对客户端的响应错误，请不要在前后调用self.write写入内容，否则会一并发出
+        :param code: HTTP的错误码
+        :param msg: 错误码内容 - 可不写
+        :param body: 响应体
+        """
         self.response.set_status(code, msg)
         self.write(body)
 
     def get(self):
+        """
+        GET请求处理方法
+        """
         self.write_error(405)
 
     def post(self):
+        """
+        POST请求处理方法
+        """
         self.write_error(405)
 
     def head(self):
+        """
+        HEAD请求处理方法
+        """
         self.write_error(400)
 
 
@@ -1580,6 +1596,7 @@ class RequestHandler(BaseRequestHandler):
         self.ui = {}
 
     def setup_response(self):
+        # 普通的响应对象
         return Response()
 
     def redirect(self, url, code=None):
@@ -1595,6 +1612,12 @@ class RequestHandler(BaseRequestHandler):
         self.response.set_header("Location", url)
 
     def render(self, file, **kwargs):
+        """
+        渲染模板
+        :param file: 模板文件名，模板的根路径通过template_path_root设置
+        :param kwargs: 渲染模板中的参数列表
+        :return:
+        """
         filename = os.path.join(Application.ins().template_path, file)
         if not os.path.exists(filename):
             raise FileExistsError("{0} not found".format(filename))
@@ -1604,16 +1627,26 @@ class RequestHandler(BaseRequestHandler):
             self.render_string(fp.read(), filename, **kwargs)
 
     def render_string(self, html, name, **kwargs):
+        """
+        渲染模板
+        :param html: 带html和模板语言的内容
+        :param name: 用于标识当前html所属
+        :param kwargs: 参数列表
+        :return:
+        """
         t = Template(html, name, self.ui)
         self.write(t.generate(**kwargs))
 
 
 class StaticFileHandler(RequestHandler):
     # 下载静态文件
+    response: FileResponse  # 通过类型重新定义覆盖提示，使得IDE能够正确
+
     def __init__(self, session:Session, request:Request):
         super().__init__(session, request)
 
     def setup_response(self):
+        # 响应的对象为文件响应对象
         return FileResponse()
 
     def request_info(self, include_body):
