@@ -908,7 +908,7 @@ class HttpConfig:
         self.runtime_global_params[name] = symbol
 
     def static_path_root(self, path):
-        self.static_path = path
+        self.static_path = os.path.abspath(path)
 
     def script_path_root(self, path):
         self.script_path = path
@@ -1708,9 +1708,16 @@ class StaticFileHandler(RequestHandler):
         path = urllib.parse.unquote(self.request.path)
         if not path.startswith("/static/"):
             return None
+        # 这里的static_path路径已经是绝对路径了
+        static_path = Application.ins().static_path
         path = path[len("/static/"):]
-        url_route_path = path if not path.startswith("/") else path[1:]
-        file_path = os.path.join(Application.ins().static_path, url_route_path)
+        url_route_path = path.lstrip("/")
+        file_path = os.path.join(static_path, url_route_path)
+        # 这里一定要严格检查资源路径，否则存在服务器被【路径遍历攻击】的风险
+        # 请求人员可以/static/../../../../../etc/passwd 获取全部用户信息
+        abs_file_path = os.path.abspath(file_path)
+        if not abs_file_path.startswith(static_path):
+            return None
         if not os.path.isfile(file_path) or not os.path.exists(file_path):
             return None
         return file_path
